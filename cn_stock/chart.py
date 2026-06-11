@@ -309,6 +309,7 @@ def generate_kline_chart(
         title=dict(text=title, x=0.5, font=dict(size=18)),
         xaxis_rangeslider_visible=False,
         template="plotly_dark",
+        modebar=dict(orientation="v", bgcolor="rgba(0,0,0,0.3)", color="rgba(255,255,255,0.9)"),
         hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=10, r=10, t=50, b=10),
