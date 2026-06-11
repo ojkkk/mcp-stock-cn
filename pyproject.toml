@@ -1,0 +1,26 @@
+[project]
+name = "mcp-stock-cn"
+version = "0.1.0"
+description = "中国股市实时行情 MCP — A股/港股实时行情、K线、财报、板块排行、北向资金，基于东方财富 API"
+authors = [{name = "mcp-stock-cn"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.4.1",
+    "pydantic>=2.0",
+    "baostock>=0.8.8",
+    "plotly>=5.0",
+]
+
+[project.urls]
+homepage = "https://github.com/ojkkk/mcp-stock-cn"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cn_stock"]
+
+[project.scripts]
+mcp-stock-cn = "cn_stock.server:main"

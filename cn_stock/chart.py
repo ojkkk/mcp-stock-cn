@@ -1,0 +1,332 @@
+"""
+Plotly 交互式 K 线图生成模块
+
+输出 HTML 文件，可在浏览器中打开，支持:
+  - 蜡烛图 + 均线叠加 (MA5/10/20/60)
+  - 成交量柱状图
+  - 技术指标副图 (MACD / KDJ / RSI)
+  - 缩放、平移、悬停查看数值
+"""
+
+from __future__ import annotations
+import os
+import tempfile
+from datetime import datetime
+from typing import Any
+
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+
+def _calc_sma(values: list[float], n: int) -> list[float | None]:
+    result: list[float | None] = []
+    window: list[float] = []
+    for v in values:
+        window.append(v)
+        if len(window) > n:
+            window.pop(0)
+        if len(window) == n:
+            result.append(round(sum(window) / n, 2))
+        else:
+            result.append(None)
+    return result
+
+
+def _calc_ema(values: list[float], n: int) -> list[float | None]:
+    if not values or n <= 0:
+        return [None] * len(values)
+    mult = 2.0 / (n + 1)
+    result: list[float | None] = []
+    prev = None
+    for i, v in enumerate(values):
+        if i < n - 1:
+            result.append(None)
+        elif i == n - 1:
+            sma = sum(values[:n]) / n
+            result.append(round(sma, 4))
+            prev = sma
+        else:
+            ema_val = (v - prev) * mult + prev
+            result.append(round(ema_val, 4))
+            prev = ema_val
+    return result
+
+
+def _calc_kdj_simple(
+    high: list[float], low: list[float], close: list[float], n: int = 9,
+) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    k: list[float | None] = []
+    d: list[float | None] = []
+    j: list[float | None] = []
+    prev_k = 50.0
+    prev_d = 50.0
+    for i in range(len(close)):
+        if i < n - 1:
+            k.append(None)
+            d.append(None)
+            j.append(None)
+            continue
+        h = max(high[i - n + 1 : i + 1])
+        l = min(low[i - n + 1 : i + 1])
+        rng = h - l
+        rsv = (close[i] - l) / rng * 100 if rng != 0 else 50.0
+        prev_k = round(2 / 3 * prev_k + 1 / 3 * rsv, 2)
+        prev_d = round(2 / 3 * prev_d + 1 / 3 * prev_k, 2)
+        k.append(prev_k)
+        d.append(prev_d)
+        j.append(round(3 * prev_k - 2 * prev_d, 2))
+    return k, d, j
+
+
+def _calc_rsi_simple(close: list[float], n: int = 14) -> list[float | None]:
+    if len(close) < n + 1:
+        return [None] * len(close)
+    gains, losses = [], []
+    for i in range(1, len(close)):
+        delta = close[i] - close[i - 1]
+        gains.append(max(delta, 0))
+        losses.append(max(-delta, 0))
+    result: list[float | None] = [None]
+    avg_gain = sum(gains[:n]) / n
+    avg_loss = sum(losses[:n]) / n
+    for i in range(len(gains)):
+        if i == n - 1:
+            rs = avg_gain / avg_loss if avg_loss != 0 else 100
+            result.append(round(100 - 100 / (1 + rs), 2))
+        elif i >= n:
+            avg_gain = (avg_gain * (n - 1) + gains[i]) / n
+            avg_loss = (avg_loss * (n - 1) + losses[i]) / n
+            rs = avg_gain / avg_loss if avg_loss != 0 else 100
+            result.append(round(100 - 100 / (1 + rs), 2))
+        else:
+            result.append(None)
+    return result
+
+
+def generate_kline_chart(
+    kline_data: list[dict[str, Any]],
+    stock_name: str = "",
+    indicators: dict[str, Any] | None = None,
+    show_volume: bool = True,
+    show_macd: bool = True,
+    show_kdj: bool = False,
+    show_rsi: bool = False,
+    output_path: str = "",
+) -> str:
+    """
+    生成交互式 K 线 HTML 图表
+
+    Args:
+        kline_data:   get_kline() 返回的 K 线列表
+        stock_name:   股票名称
+        indicators:   compute_all_indicators() 的结果（可选）
+        show_volume:  是否显示成交量副图
+        show_macd:    是否显示 MACD 副图
+        show_kdj:     是否显示 KDJ 副图
+        show_rsi:     是否显示 RSI 副图
+        output_path:  输出文件路径，留空自动生成
+
+    Returns:
+        HTML 文件绝对路径
+    """
+    if not kline_data:
+        raise ValueError("K 线数据为空")
+
+    dates = [k["日期"] for k in kline_data]
+    opens = [float(k["开盘价"]) for k in kline_data]
+    highs = [float(k["最高价"]) for k in kline_data]
+    lows = [float(k["最低价"]) for k in kline_data]
+    closes = [float(k["收盘价"]) for k in kline_data]
+    volumes = [float(k.get("成交量(手)", 0) or 0) for k in kline_data]
+
+    # ── 计算副图行数及位置 ──
+    subplot_rows = 1
+    row_volume = row_macd = row_kdj = row_rsi = 0
+    cr = 1
+    if show_volume:
+        cr += 1
+        row_volume = cr
+    if show_macd:
+        cr += 1
+        row_macd = cr
+    if show_kdj:
+        cr += 1
+        row_kdj = cr
+    if show_rsi:
+        cr += 1
+        row_rsi = cr
+    subplot_rows = cr
+
+    # ── 行高 ──
+    main_h = 0.5
+    sub_h = (1.0 - main_h) / (subplot_rows - 1) if subplot_rows > 1 else 0.5
+    row_heights = [main_h] + [sub_h] * (subplot_rows - 1)
+
+    specs = [[{"secondary_y": False}]]
+    for _ in range(subplot_rows - 1):
+        specs.append([{"secondary_y": False}])
+
+    fig = make_subplots(
+        rows=subplot_rows, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.03,
+        row_heights=row_heights,
+        specs=specs,
+    )
+
+    # ═══════════════════════════════════════════
+    # 主图: 蜡烛图 + 均线
+    # ═══════════════════════════════════════════
+    candle = go.Candlestick(
+        x=dates,
+        open=opens, high=highs, low=lows, close=closes,
+        name="K线",
+        increasing_line_color="#ef5350",
+        decreasing_line_color="#26a69a",
+        increasing_fillcolor="#ef5350",
+        decreasing_fillcolor="#26a69a",
+    )
+    fig.add_trace(candle, row=1, col=1)
+
+    for label, period, color in [
+        ("MA5", 5, "#FF9800"),
+        ("MA10", 10, "#2196F3"),
+        ("MA20", 20, "#9C27B0"),
+        ("MA60", 60, "#4CAF50"),
+    ]:
+        if len(closes) >= period:
+            ma_vals = _calc_sma(closes, period)
+            fig.add_trace(go.Scatter(
+                x=dates, y=ma_vals,
+                mode="lines", name=label,
+                line=dict(color=color, width=1.2), opacity=0.7,
+            ), row=1, col=1)
+
+    # ═══════════════════════════════════════════
+    # 成交量
+    # ═══════════════════════════════════════════
+    if show_volume and row_volume:
+        vol_colors = []
+        for i in range(len(closes)):
+            if i > 0 and closes[i] >= closes[i - 1]:
+                vol_colors.append("#ef5350")
+            else:
+                vol_colors.append("#26a69a")
+        fig.add_trace(go.Bar(
+            x=dates, y=volumes, name="成交量(手)",
+            marker_color=vol_colors, opacity=0.6, showlegend=False,
+        ), row=row_volume, col=1)
+        fig.update_yaxes(title_text="成交量(手)", row=row_volume, col=1)
+
+    # ═══════════════════════════════════════════
+    # MACD
+    # ═══════════════════════════════════════════
+    if show_macd and row_macd:
+        dif = _calc_ema(closes, 12)
+        dea = _calc_ema(closes, 26)
+        macd_dif: list[float | None] = []
+        for i in range(len(closes)):
+            if dif[i] is not None and dea[i] is not None:
+                macd_dif.append(round(dif[i] - dea[i], 4))
+            else:
+                macd_dif.append(None)
+        dif_clean = [x if x is not None else 0.0 for x in macd_dif]
+        dea_list = _calc_ema(dif_clean, 9)
+        macd_dea: list[float | None] = []
+        macd_bar: list[float | None] = []
+        for i in range(len(macd_dif)):
+            if macd_dif[i] is not None and dea_list[i] is not None:
+                macd_dea.append(dea_list[i])
+                macd_bar.append(round((macd_dif[i] - dea_list[i]) * 2, 4))
+            else:
+                macd_dea.append(None)
+                macd_bar.append(None)
+
+        bar_colors = [
+            "#ef5350" if v is not None and v >= 0 else "#26a69a" if v is not None else "#999"
+            for v in macd_bar
+        ]
+        fig.add_trace(go.Bar(
+            x=dates, y=macd_bar, name="MACD柱",
+            marker_color=bar_colors, opacity=0.5, showlegend=False,
+        ), row=row_macd, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=macd_dif, name="DIF",
+            line=dict(color="#FF9800", width=1.2),
+        ), row=row_macd, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=macd_dea, name="DEA",
+            line=dict(color="#2196F3", width=1.2),
+        ), row=row_macd, col=1)
+        fig.add_hline(y=0, line_dash="dash", line_color="#666", opacity=0.3, row=row_macd, col=1)
+        fig.update_yaxes(title_text="MACD", row=row_macd, col=1)
+
+    # ═══════════════════════════════════════════
+    # KDJ
+    # ═══════════════════════════════════════════
+    if show_kdj and row_kdj:
+        kdj_k, kdj_d, kdj_j = _calc_kdj_simple(highs, lows, closes)
+        fig.add_trace(go.Scatter(
+            x=dates, y=kdj_k, name="K",
+            line=dict(color="#FF9800", width=1.2),
+        ), row=row_kdj, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=kdj_d, name="D",
+            line=dict(color="#2196F3", width=1.2),
+        ), row=row_kdj, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=kdj_j, name="J",
+            line=dict(color="#9C27B0", width=1.2),
+        ), row=row_kdj, col=1)
+        fig.add_hline(y=80, line_dash="dash", line_color="#ef5350", opacity=0.3, row=row_kdj, col=1)
+        fig.add_hline(y=20, line_dash="dash", line_color="#26a69a", opacity=0.3, row=row_kdj, col=1)
+        fig.update_yaxes(title_text="KDJ", row=row_kdj, col=1, range=[0, 100])
+
+    # ═══════════════════════════════════════════
+    # RSI
+    # ═══════════════════════════════════════════
+    if show_rsi and row_rsi:
+        rsi6 = _calc_rsi_simple(closes, 6)
+        rsi14 = _calc_rsi_simple(closes, 14)
+        fig.add_trace(go.Scatter(
+            x=dates, y=rsi6, name="RSI6",
+            line=dict(color="#FF9800", width=1),
+        ), row=row_rsi, col=1)
+        fig.add_trace(go.Scatter(
+            x=dates, y=rsi14, name="RSI14",
+            line=dict(color="#2196F3", width=1.5),
+        ), row=row_rsi, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="#ef5350", opacity=0.3, row=row_rsi, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="#26a69a", opacity=0.3, row=row_rsi, col=1)
+        fig.add_hline(y=50, line_dash="dot", line_color="#666", opacity=0.2, row=row_rsi, col=1)
+        fig.update_yaxes(title_text="RSI", row=row_rsi, col=1, range=[0, 100])
+
+    # ═══════════════════════════════════════════
+    # 布局
+    # ═══════════════════════════════════════════
+    title = f"{stock_name or '股票'} — K线图"
+    fig.update_layout(
+        title=dict(text=title, x=0.5, font=dict(size=18)),
+        xaxis_rangeslider_visible=False,
+        template="plotly_dark",
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=10, r=10, t=50, b=10),
+        height=400 + 200 * (subplot_rows - 1),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#333", row=subplot_rows, col=1)
+    fig.update_yaxes(title_text="价格(元)", row=1, col=1, showgrid=True, gridcolor="#333")
+
+    # ── 输出 HTML ──
+    if not output_path:
+        chart_dir = os.path.join(tempfile.gettempdir(), "mcp-stock-cn-charts")
+        os.makedirs(chart_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = stock_name.replace("/", "_").replace("\\", "_") if stock_name else "chart"
+        output_path = os.path.join(chart_dir, f"{safe_name}_{ts}.html")
+
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    return os.path.abspath(output_path)
